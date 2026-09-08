@@ -596,6 +596,7 @@ pub fn build_app(
         .route("/health", get(health))
         .route("/health_generate", get(health_generate))
         .route("/engine_metrics", get(engine_metrics))
+        .route("/metrics", get(engine_metrics))
         .route("/v1/models", get(v1_models))
         .route("/model_info", get(get_model_info))
         // TODO: Remove `/get_model_info` alias after one release-cycle deprecation window.
