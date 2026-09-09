@@ -54,6 +54,7 @@ pub struct PDRouter {
     pub retry_config: RetryConfig,
     pub api_key: Option<String>,
     pub enable_igw: bool,
+    admission: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 struct PreparedWorkerRequest<'a> {
@@ -185,6 +186,14 @@ impl PDRouter {
             retry_config: ctx.router_config.effective_retry_config(),
             api_key: ctx.router_config.api_key.clone(),
             enable_igw: ctx.router_config.enable_igw,
+            admission: std::env::var("SGLANG_PD_MAX_INFLIGHT")
+                .ok()
+                .map(|v| {
+                    v.parse::<usize>()
+                        .map_err(|_| "Invalid SGLANG_PD_MAX_INFLIGHT".to_string())
+                })
+                .transpose()?
+                .map(|n| Arc::new(tokio::sync::Semaphore::new(n))),
         })
     }
 
@@ -369,6 +378,20 @@ impl PDRouter {
         context: PDRequestContext<'_>,
         original_json: Option<&Value>,
     ) -> Response {
+        // Reject before selecting or dispatching either PD leg. Keep the slot
+        // until the response body is dropped, including streaming responses.
+        let permit = match &self.admission {
+            Some(limit) => match Arc::clone(limit).try_acquire_owned() {
+                Ok(permit) => Some(permit),
+                Err(_) => {
+                    return error::service_unavailable(
+                        "pd_concurrency_limit",
+                        "PD inference concurrency limit reached",
+                    )
+                }
+            },
+            None => None,
+        };
         let start_time = Instant::now();
 
         let route = context.route;
@@ -520,7 +543,7 @@ impl PDRouter {
             );
         }
 
-        response
+        crate::core::AttachedBody::wrap_response(response, permit)
     }
 
     async fn handle_decode_error_response(
@@ -1872,6 +1895,7 @@ mod tests {
             retry_config: RetryConfig::default(),
             api_key: Some("test_api_key".to_string()),
             enable_igw: false,
+            admission: None,
         }
     }
 
@@ -1952,6 +1976,27 @@ mod tests {
             assert!(body.get("bootstrap_room").is_some());
         }
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn admission_slot_is_held_until_response_drop() {
+        let mut router = create_test_pd_router();
+        let limit = Arc::new(tokio::sync::Semaphore::new(1));
+        router.admission = Some(limit.clone());
+        let body: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "test", "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .unwrap();
+        let first = router.route_chat(None, &body, None).await;
+        assert_eq!(limit.available_permits(), 0);
+        let rejected = router.route_chat(None, &body, None).await;
+        assert_eq!(rejected.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = axum::body::to_bytes(rejected.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&bytes).contains("pd_concurrency_limit"));
+        drop(first);
+        assert_eq!(limit.available_permits(), 1);
     }
 
     #[test]
@@ -2211,6 +2256,7 @@ mod tests {
                 None,
                 prefill_ref.clone(),
                 decode_ref.clone(),
+                None,
             );
 
             // Guards are now attached to response body, so load should be 1
