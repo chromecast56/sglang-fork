@@ -349,3 +349,19 @@ fn test_pd_roles_and_worker_addresses_remain_distinct() {
     assert!(result.contains("sglang:num_prefill_bootstrap_queue_reqs{"));
     assert!(result.contains("sglang:num_decode_transfer_queue_reqs{"));
 }
+
+#[test]
+fn test_literal_colon_escape_is_not_rewritten() {
+    let pack = MetricPack {
+        labels: vec![("worker".into(), "hostxsmgcolon0z:8000".into())],
+        metrics_text: r#"# HELP sglang:test__smg_colon__ A __smg_colon__ literal.
+# TYPE sglang:test__smg_colon__ gauge
+sglang:test__smg_colon__{value="a__smg_colon__:xsmgcolon0z:b"} 1
+"#
+        .into(),
+    };
+    let text = aggregate_metrics(vec![pack]).unwrap();
+    assert!(text.contains("sglang:test__smg_colon__"));
+    assert!(text.contains("a__smg_colon__:xsmgcolon0z:b"));
+    assert!(text.contains("hostxsmgcolon0z:8000"));
+}
