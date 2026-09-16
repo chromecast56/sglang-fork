@@ -28,7 +28,7 @@ pub mod header_utils;
 pub mod http;
 pub mod mcp_utils;
 pub mod mesh;
-pub mod native_messages;
+pub mod native_protocol;
 pub mod openai;
 pub mod parse;
 pub mod persistence_utils;
@@ -117,7 +117,7 @@ pub trait RouterTrait: Send + Sync + Debug {
     async fn route_messages(
         &self,
         _headers: Option<&HeaderMap>,
-        _body: &native_messages::NativeMessagesRequest,
+        _body: &native_protocol::NativeRequest,
         _model_id: Option<&str>,
     ) -> Response {
         (
@@ -131,7 +131,7 @@ pub trait RouterTrait: Send + Sync + Debug {
     async fn route_messages_count_tokens(
         &self,
         _headers: Option<&HeaderMap>,
-        _body: &native_messages::NativeMessagesRequest,
+        _body: &native_protocol::NativeRequest,
         _model_id: Option<&str>,
     ) -> Response {
         (
@@ -139,6 +139,25 @@ pub trait RouterTrait: Send + Sync + Debug {
             "Native Messages token counting not implemented",
         )
             .into_response()
+    }
+
+    /// HTTP engines own their native Responses schema. Other backends retain
+    /// their existing typed validation and conversion behavior.
+    async fn route_native_responses(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &native_protocol::NativeRequest,
+        model_id: Option<&str>,
+    ) -> Response {
+        use validator::Validate;
+        let request = match serde_json::from_value::<ResponsesRequest>(body.0.clone()) {
+            Ok(request) => request,
+            Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+        };
+        if let Err(error) = request.validate() {
+            return (StatusCode::BAD_REQUEST, error.to_string()).into_response();
+        }
+        self.route_responses(headers, &request, model_id).await
     }
 
     /// Route a responses request

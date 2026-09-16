@@ -48,7 +48,7 @@ use crate::{
         generate::GenerateRequest,
         parser::{ParseFunctionCallRequest, SeparateReasoningRequest},
         rerank::V1RerankReqInput,
-        responses::{ResponsesGetParams, ResponsesRequest},
+        responses::ResponsesGetParams,
         tokenize::{AddTokenizerRequest, DetokenizeRequest, TokenizeRequest},
         validated::ValidatedJson,
         worker_spec::{WorkerConfigRequest, WorkerUpdateRequest},
@@ -252,7 +252,7 @@ async fn v1_rerank(
 async fn v1_messages(
     State(state): State<Arc<AppState>>,
     headers: http::HeaderMap,
-    Json(body): Json<crate::routers::native_messages::NativeMessagesRequest>,
+    Json(body): Json<crate::routers::native_protocol::NativeRequest>,
 ) -> Response {
     use crate::protocols::common::GenerationRequest;
     state
@@ -264,7 +264,7 @@ async fn v1_messages(
 async fn v1_messages_count_tokens(
     State(state): State<Arc<AppState>>,
     headers: http::HeaderMap,
-    Json(body): Json<crate::routers::native_messages::NativeMessagesRequest>,
+    Json(body): Json<crate::routers::native_protocol::NativeRequest>,
 ) -> Response {
     use crate::protocols::common::GenerationRequest;
     state
@@ -276,11 +276,12 @@ async fn v1_messages_count_tokens(
 async fn v1_responses(
     State(state): State<Arc<AppState>>,
     headers: http::HeaderMap,
-    ValidatedJson(body): ValidatedJson<ResponsesRequest>,
+    Json(body): Json<crate::routers::native_protocol::NativeRequest>,
 ) -> Response {
+    use crate::protocols::common::GenerationRequest;
     state
         .router
-        .route_responses(Some(&headers), &body, Some(&body.model))
+        .route_native_responses(Some(&headers), &body, body.get_model())
         .await
 }
 

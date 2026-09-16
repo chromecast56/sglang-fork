@@ -36,6 +36,7 @@ use crate::{
         embedding::EmbeddingRequest,
         generate::GenerateRequest,
         rerank::RerankRequest,
+        responses::{ResponsesGetParams, ResponsesRequest},
     },
     routers::{
         error,
@@ -95,6 +96,102 @@ fn native_messages_error(message: &str) -> Response {
 impl PDRouter {
     fn worker_endpoint_url(worker: &dyn Worker, endpoint: &str) -> String {
         api_path(worker.base_url(), endpoint)
+    }
+
+    /// Responses state (including previous_response_id and background jobs)
+    /// belongs to the sole decode HTTP frontend. It coordinates each prefill
+    /// turn with its configured P endpoint; duplicating the Responses request
+    /// across P and D would create divergent conversation stores.
+    async fn proxy_native_responses(
+        &self,
+        headers: Option<&HeaderMap>,
+        method: reqwest::Method,
+        suffix: &[&str],
+        body: Option<&Value>,
+        params: Option<&ResponsesGetParams>,
+    ) -> Response {
+        let workers = self.worker_registry.get_decode_workers();
+        if workers.len() != 1 {
+            return error::service_unavailable(
+                "responses_state_owner",
+                "Native HTTP PD Responses requires exactly one decode worker",
+            );
+        }
+        let worker = workers[0].clone();
+        if !worker.is_available() {
+            return error::service_unavailable(
+                "responses_decode_unavailable",
+                "Decode worker unavailable",
+            );
+        }
+        let mut url = match url::Url::parse(worker.url()) {
+            Ok(url) => url,
+            Err(_) => {
+                return error::internal_error("responses_worker_url", "Invalid decode worker URL")
+            }
+        };
+        // Push identifiers as path segments: a response ID must not become a
+        // path traversal or a different worker API route.
+        {
+            let Ok(mut segments) = url.path_segments_mut() else {
+                return error::internal_error("responses_worker_url", "Invalid decode worker URL");
+            };
+            segments.pop_if_empty().push("v1").push("responses");
+            for part in suffix {
+                segments.push(part);
+            }
+        }
+        if let Some(params) = params {
+            let mut query = url.query_pairs_mut();
+            for include in &params.include {
+                query.append_pair("include", include);
+            }
+            if let Some(value) = params.include_obfuscation {
+                query.append_pair("include_obfuscation", &value.to_string());
+            }
+            if let Some(value) = params.starting_after {
+                query.append_pair("starting_after", &value.to_string());
+            }
+            if let Some(value) = params.stream {
+                query.append_pair("stream", &value.to_string());
+            }
+        }
+        let guard = WorkerLoadGuard::new(worker.clone(), headers);
+        let mut request = self.client.request(method, url);
+        if let Some(body) = body {
+            request = request.json(body);
+        }
+        if let Some(headers) = headers {
+            for (name, value) in headers {
+                if header_utils::should_forward_request_header(name.as_str()) {
+                    request = request.header(name, value);
+                }
+            }
+        }
+        match request.send().await {
+            Ok(upstream) => {
+                let status = upstream.status();
+                let headers = header_utils::preserve_response_headers(upstream.headers());
+                let mut stream = BreakerTrackedStream::new(
+                    upstream.bytes_stream(),
+                    worker.clone(),
+                    worker.url().to_string(),
+                );
+                if status.is_server_error() {
+                    stream.mark_errored();
+                }
+                let mut response = Response::new(Body::from_stream(stream));
+                *response.status_mut() = status;
+                *response.headers_mut() = headers;
+                // Streaming directly from reqwest keeps cancellation attached to
+                // the client body; there is no detached background relay.
+                crate::core::AttachedBody::wrap_response(response, guard)
+            }
+            Err(error) => {
+                worker.record_outcome(false);
+                error::bad_gateway("responses_decode_connection", error.to_string())
+            }
+        }
     }
 
     async fn proxy_to_first_prefill_worker(
@@ -1805,7 +1902,7 @@ impl RouterTrait for PDRouter {
     async fn route_messages(
         &self,
         headers: Option<&HeaderMap>,
-        body: &crate::routers::native_messages::NativeMessagesRequest,
+        body: &crate::routers::native_protocol::NativeRequest,
         model_id: Option<&str>,
     ) -> Response {
         use crate::protocols::common::GenerationRequest;
@@ -1827,7 +1924,7 @@ impl RouterTrait for PDRouter {
     async fn route_messages_count_tokens(
         &self,
         headers: Option<&HeaderMap>,
-        body: &crate::routers::native_messages::NativeMessagesRequest,
+        body: &crate::routers::native_protocol::NativeRequest,
         model_id: Option<&str>,
     ) -> Response {
         let workers = if self.enable_igw {
@@ -1864,6 +1961,82 @@ impl RouterTrait for PDRouter {
             }
             Err(_) => native_messages_error("Token-count connection failed"),
         }
+    }
+
+    async fn route_native_responses(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &crate::routers::native_protocol::NativeRequest,
+        _model_id: Option<&str>,
+    ) -> Response {
+        self.proxy_native_responses(headers, reqwest::Method::POST, &[], Some(&body.0), None)
+            .await
+    }
+
+    async fn route_responses(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &ResponsesRequest,
+        model_id: Option<&str>,
+    ) -> Response {
+        match serde_json::to_value(body) {
+            Ok(body) => {
+                self.route_native_responses(
+                    headers,
+                    &crate::routers::native_protocol::NativeRequest(body),
+                    model_id,
+                )
+                .await
+            }
+            Err(error) => Self::handle_serialization_error(error),
+        }
+    }
+
+    async fn get_response(
+        &self,
+        headers: Option<&HeaderMap>,
+        response_id: &str,
+        params: &ResponsesGetParams,
+    ) -> Response {
+        self.proxy_native_responses(
+            headers,
+            reqwest::Method::GET,
+            &[response_id],
+            None,
+            Some(params),
+        )
+        .await
+    }
+
+    async fn cancel_response(&self, headers: Option<&HeaderMap>, response_id: &str) -> Response {
+        self.proxy_native_responses(
+            headers,
+            reqwest::Method::POST,
+            &[response_id, "cancel"],
+            None,
+            None,
+        )
+        .await
+    }
+
+    async fn delete_response(&self, headers: Option<&HeaderMap>, response_id: &str) -> Response {
+        self.proxy_native_responses(headers, reqwest::Method::DELETE, &[response_id], None, None)
+            .await
+    }
+
+    async fn list_response_input_items(
+        &self,
+        headers: Option<&HeaderMap>,
+        response_id: &str,
+    ) -> Response {
+        self.proxy_native_responses(
+            headers,
+            reqwest::Method::GET,
+            &[response_id, "input_items"],
+            None,
+            None,
+        )
+        .await
     }
 
     async fn route_completion(
@@ -2060,7 +2233,7 @@ mod tests {
             "tools":[{"name":"tool","input_schema":{"type":"object","properties":{}}}],
             "future_extension":{"number":0.9500000001}
         });
-        let body = crate::routers::native_messages::NativeMessagesRequest(original.clone());
+        let body = crate::routers::native_protocol::NativeRequest(original.clone());
         let mut headers = HeaderMap::new();
         headers.insert("anthropic-version", "2023-06-01".parse().unwrap());
         let response = router
@@ -2111,7 +2284,7 @@ mod tests {
             }),
         );
         let (router, tasks) = messages_test_pair(prefill, decode).await;
-        let body = crate::routers::native_messages::NativeMessagesRequest(json!({
+        let body = crate::routers::native_protocol::NativeRequest(json!({
             "model":"test","max_tokens":16,"messages":[],"stream":true
         }));
         let response = tokio::time::timeout(
@@ -2159,7 +2332,7 @@ mod tests {
                     ));
                 }
                 let (router, tasks) = messages_test_pair(apps.remove(0), apps.remove(0)).await;
-                let body = crate::routers::native_messages::NativeMessagesRequest(json!({
+                let body = crate::routers::native_protocol::NativeRequest(json!({
                     "model":"test","max_tokens":16,"messages":[],"stream":stream
                 }));
                 let response = router.route_messages(None, &body, None).await;
@@ -2190,7 +2363,7 @@ mod tests {
         );
         let decode = axum::Router::new().fallback(|| async { StatusCode::INTERNAL_SERVER_ERROR });
         let (router, tasks) = messages_test_pair(prefill, decode).await;
-        let body = crate::routers::native_messages::NativeMessagesRequest(json!({
+        let body = crate::routers::native_protocol::NativeRequest(json!({
             "model":"test","messages":[{"role":"user","content":[
                 {"type":"image","source":{"type":"base64","media_type":"image/png","data":"fixture"}}
             ]}]
@@ -2207,6 +2380,171 @@ mod tests {
         for task in tasks {
             task.abort();
         }
+    }
+
+    #[tokio::test]
+    async fn native_responses_routes_state_operations_to_decode_without_dual_dispatch() {
+        use std::sync::Mutex;
+        let received = Arc::new(Mutex::new(Vec::<(String, String, Value)>::new()));
+        let captured = received.clone();
+        let decode = axum::Router::new().fallback(move |request: Request<Body>| {
+            let captured = captured.clone();
+            async move {
+                let method = request.method().to_string();
+                let uri = request.uri().to_string();
+                let bytes = axum::body::to_bytes(request.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                let body = if bytes.is_empty() {
+                    Value::Null
+                } else {
+                    serde_json::from_slice(&bytes).unwrap()
+                };
+                captured.lock().unwrap().push((method, uri, body));
+                (
+                    [(CONTENT_TYPE, "application/json")],
+                    r#"{"id":"resp_owner","status":"queued"}"#,
+                )
+            }
+        });
+        let prefill = axum::Router::new().fallback(|| async { StatusCode::INTERNAL_SERVER_ERROR });
+        let (router, tasks) = messages_test_pair(prefill, decode).await;
+        let original = json!({
+            "input":[{"type":"message","role":"user","content":[
+                {"type":"input_image","image_url":"data:image/png;base64,fixture","detail":"original"},
+                {"type":"input_text","text":"hello"}
+            ]}],
+            "previous_response_id":"resp_previous", "store":true, "background":true,
+            "top_p":0.95, "reasoning":{"effort":"high"},
+            "tools":[{"type":"function","name":"tool","parameters":{"type":"object"}}],
+            "future_extension":{"large_id":9007199254740993u64}
+        });
+        let request = crate::routers::native_protocol::NativeRequest(original.clone());
+        // Model is optional in the native SGLang Responses contract.
+        let response = router.route_native_responses(None, &request, None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(bytes, r#"{"id":"resp_owner","status":"queued"}"#.as_bytes());
+        let params = ResponsesGetParams {
+            include: vec!["message.output_text.logprobs".to_string()],
+            include_obfuscation: Some(false),
+            starting_after: Some(7),
+            stream: Some(true),
+        };
+        for response in [
+            router.get_response(None, "resp_owner", &params).await,
+            router.cancel_response(None, "resp_owner").await,
+            router.delete_response(None, "resp_owner").await,
+            router.list_response_input_items(None, "resp_owner").await,
+        ] {
+            assert_eq!(response.status(), StatusCode::OK);
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+        }
+        let received = received.lock().unwrap();
+        assert_eq!(received.len(), 5);
+        assert_eq!(
+            received[0],
+            ("POST".into(), "/v1/responses".into(), original)
+        );
+        assert_eq!(received[1].0, "GET");
+        assert!(received[1].1.contains("starting_after=7"));
+        assert!(received[1].1.contains("stream=true"));
+        assert!(received[1]
+            .1
+            .contains("include=message.output_text.logprobs"));
+        assert_eq!(received[2].0, "POST");
+        assert_eq!(received[2].1, "/v1/responses/resp_owner/cancel");
+        assert_eq!(received[3].0, "DELETE");
+        assert_eq!(received[4].1, "/v1/responses/resp_owner/input_items");
+        for task in tasks {
+            task.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn native_responses_preserves_errors_and_sse_and_drops_upstream() {
+        use futures_util::StreamExt;
+        struct NotifyOnDrop(Arc<tokio::sync::Notify>);
+        impl Drop for NotifyOnDrop {
+            fn drop(&mut self) {
+                self.0.notify_one();
+            }
+        }
+        let dropped = Arc::new(tokio::sync::Notify::new());
+        let notify = dropped.clone();
+        let decode = axum::Router::new().route("/v1/responses", axum::routing::post(
+            move |axum::Json(body): axum::Json<Value>| {
+                let notify = notify.clone();
+                async move {
+                    if body["stream"] != true {
+                        return (StatusCode::BAD_REQUEST, axum::Json(json!({
+                            "error":{"type":"invalid_request_error","message":"invalid previous_response_id"}
+                        }))).into_response();
+                    }
+                    let guard = NotifyOnDrop(notify);
+                    let event = futures_util::stream::once(async {
+                        Ok::<_, std::io::Error>(bytes::Bytes::from_static(
+                            b"event: response.created\ndata: {\"type\":\"response.created\"}\n\n"
+                        ))
+                    });
+                    let pending = futures_util::stream::unfold(guard, |guard| async move {
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                        Some((Ok::<_, std::io::Error>(bytes::Bytes::from_static(b": keepalive\n\n")), guard))
+                    });
+                    ([(CONTENT_TYPE, "text/event-stream")], Body::from_stream(event.chain(pending))).into_response()
+                }
+            }
+        ));
+        let (router, tasks) = messages_test_pair(axum::Router::new(), decode).await;
+        let request =
+            crate::routers::native_protocol::NativeRequest(json!({"input":"hello","stream":false}));
+        let response = router.route_native_responses(None, &request, None).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let error: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(error["error"]["message"], "invalid previous_response_id");
+        let request =
+            crate::routers::native_protocol::NativeRequest(json!({"input":"hello","stream":true}));
+        let response = router.route_native_responses(None, &request, None).await;
+        assert_eq!(response.headers()[CONTENT_TYPE], "text/event-stream");
+        let worker = router.worker_registry.get_decode_workers()[0].clone();
+        assert_eq!(worker.load(), 1);
+        let mut stream = response.into_body().into_data_stream();
+        let first = stream.next().await.unwrap().unwrap();
+        assert!(String::from_utf8_lossy(&first).contains("event: response.created"));
+        drop(stream);
+        assert_eq!(worker.load(), 0);
+        tokio::time::timeout(std::time::Duration::from_secs(2), dropped.notified())
+            .await
+            .expect("client disconnect must close decode stream");
+        for task in tasks {
+            task.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn native_responses_rejects_ambiguous_state_owner() {
+        let router = create_test_pd_router();
+        for url in ["http://decode-one", "http://decode-two"] {
+            router
+                .worker_registry
+                .register(Arc::from(create_test_worker(
+                    url.to_string(),
+                    WorkerType::Decode,
+                    true,
+                )));
+        }
+        let request = crate::routers::native_protocol::NativeRequest(json!({"input":"hello"}));
+        let response = router.route_native_responses(None, &request, None).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]

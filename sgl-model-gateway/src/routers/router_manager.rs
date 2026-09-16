@@ -629,7 +629,7 @@ impl RouterTrait for RouterManager {
     async fn route_messages(
         &self,
         headers: Option<&HeaderMap>,
-        body: &crate::routers::native_messages::NativeMessagesRequest,
+        body: &crate::routers::native_protocol::NativeRequest,
         model_id: Option<&str>,
     ) -> Response {
         let effective_model_id = if self.enable_igw {
@@ -655,7 +655,7 @@ impl RouterTrait for RouterManager {
     async fn route_messages_count_tokens(
         &self,
         headers: Option<&HeaderMap>,
-        body: &crate::routers::native_messages::NativeMessagesRequest,
+        body: &crate::routers::native_protocol::NativeRequest,
         model_id: Option<&str>,
     ) -> Response {
         let effective_model_id = if self.enable_igw {
@@ -675,6 +675,33 @@ impl RouterTrait for RouterManager {
             (
                 StatusCode::NOT_FOUND,
                 "No router available to count messages tokens",
+            )
+                .into_response()
+        }
+    }
+
+    async fn route_native_responses(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &crate::routers::native_protocol::NativeRequest,
+        model_id: Option<&str>,
+    ) -> Response {
+        let model = if self.enable_igw {
+            match self.resolve_model_id(model_id) {
+                Ok(model) => Some(model),
+                Err(response) => return *response,
+            }
+        } else {
+            model_id.map(str::to_owned)
+        };
+        if let Some(router) = self.select_router_for_request(headers, model.as_deref()) {
+            router
+                .route_native_responses(headers, body, model.as_deref())
+                .await
+        } else {
+            (
+                StatusCode::NOT_FOUND,
+                "No router available to handle responses request",
             )
                 .into_response()
         }

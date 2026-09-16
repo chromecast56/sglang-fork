@@ -1,4 +1,4 @@
-//! Native Messages requests are forwarded without an OpenAI conversion.
+//! Native HTTP requests are forwarded without an OpenAI conversion.
 //! The engine owns protocol validation, tools, reasoning and multimodal semantics.
 
 use serde::{Deserialize, Serialize};
@@ -8,9 +8,9 @@ use crate::protocols::common::GenerationRequest;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(transparent)]
-pub struct NativeMessagesRequest(pub Value);
+pub struct NativeRequest(pub Value);
 
-impl GenerationRequest for NativeMessagesRequest {
+impl GenerationRequest for NativeRequest {
     fn is_stream(&self) -> bool {
         self.0
             .get("stream")
@@ -27,7 +27,12 @@ impl GenerationRequest for NativeMessagesRequest {
         // Include system/tools/media identity so distinct prefixes do not alias.
         let mut prefix = self.0.clone();
         if let Some(object) = prefix.as_object_mut() {
-            object.retain(|key, _| matches!(key.as_str(), "system" | "tools" | "messages"));
+            object.retain(|key, _| {
+                matches!(
+                    key.as_str(),
+                    "system" | "tools" | "messages" | "input" | "instructions"
+                )
+            });
         }
         prefix.to_string()
     }
