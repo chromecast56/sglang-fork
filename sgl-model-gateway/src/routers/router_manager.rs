@@ -758,12 +758,16 @@ impl RouterTrait for RouterManager {
         }
     }
 
-    async fn delete_response(&self, _headers: Option<&HeaderMap>, _response_id: &str) -> Response {
-        (
-            StatusCode::NOT_IMPLEMENTED,
-            "responses api not yet implemented in inference gateway mode",
-        )
-            .into_response()
+    async fn delete_response(&self, headers: Option<&HeaderMap>, response_id: &str) -> Response {
+        if let Some(router) = self.select_router_for_request(headers, None) {
+            router.delete_response(headers, response_id).await
+        } else {
+            (
+                StatusCode::NOT_FOUND,
+                "No router available to delete response",
+            )
+                .into_response()
+        }
     }
 
     async fn list_response_input_items(

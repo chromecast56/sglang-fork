@@ -2466,6 +2466,14 @@ mod tests {
         });
         let prefill = axum::Router::new().fallback(|| async { StatusCode::INTERNAL_SERVER_ERROR });
         let (router, tasks) = messages_test_pair(prefill, decode).await;
+        let manager =
+            crate::routers::router_manager::RouterManager::new(router.worker_registry.clone());
+        manager.register_router(
+            crate::routers::router_manager::router_ids::HTTP_PD,
+            Arc::new(router),
+        );
+        manager.set_default_router(crate::routers::router_manager::router_ids::HTTP_PD);
+        let router = manager;
         let original = json!({
             "input":[{"type":"message","role":"user","content":[
                 {"type":"input_image","image_url":"data:image/png;base64,fixture","detail":"original"},
