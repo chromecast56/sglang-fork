@@ -833,7 +833,21 @@ impl PDRouter {
         let mut prefill_fut: futures::future::BoxFuture<
             'static,
             Result<reqwest::Response, reqwest::Error>,
-        > = Box::pin(prefill_request.send());
+        > = Box::pin(async move {
+            // Treat a prefill leg as pending until its body is drained, not just
+            // until headers arrive. SSE keepalives/early headers are not proof
+            // that KV transfer has completed. Decode may stream meanwhile.
+            let response = prefill_request.send().await?;
+            let status = response.status();
+            let version = response.version();
+            let headers = response.headers().clone();
+            let body = response.bytes().await?;
+            let mut completed = http::Response::new(body);
+            *completed.status_mut() = status;
+            *completed.version_mut() = version;
+            *completed.headers_mut() = headers;
+            Ok(reqwest::Response::from(completed))
+        });
         let decode_fut = decode_request.send();
         tokio::pin!(decode_fut);
 
@@ -1340,6 +1354,7 @@ impl PDRouter {
             None => Box::pin(std::future::pending()),
         };
         tokio::spawn(async move {
+            let mut client_disconnected = false;
             loop {
                 tokio::select! {
                     biased;
@@ -1410,6 +1425,7 @@ impl PDRouter {
                                 }
 
                                 if tx.send(Ok(result)).is_err() {
+                                    client_disconnected = true;
                                     tracing::debug!(
                                         "Receiver dropped (likely client disconnect), \
                                         cancelling upstream PD stream"
@@ -1432,6 +1448,7 @@ impl PDRouter {
                         }
                     }
                     _ = tx.closed() => {
+                        client_disconnected = true;
                         tracing::info!(
                             "Client disconnected, cancelling upstream PD stream from {}",
                             decode_for_log.url()
@@ -1440,8 +1457,8 @@ impl PDRouter {
                     }
                 }
             }
-            if prefill_pending {
-                // The client stream ended before the prefill leg resolved: let
+            if prefill_pending && !client_disconnected {
+                // Decode finished before the prefill leg resolved: let
                 // it finish on its own so its breaker outcome is recorded and
                 // its connection is not severed mid-request.
                 tokio::spawn(async move {
@@ -2545,6 +2562,89 @@ mod tests {
         let request = crate::routers::native_protocol::NativeRequest(json!({"input":"hello"}));
         let response = router.route_native_responses(None, &request, None).await;
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn prefill_body_drain_does_not_delay_decode_and_cancels_with_client() {
+        use futures_util::StreamExt;
+        struct NotifyOnDrop(Arc<tokio::sync::Notify>);
+        impl Drop for NotifyOnDrop {
+            fn drop(&mut self) {
+                self.0.notify_one();
+            }
+        }
+        let dropped = Arc::new(tokio::sync::Notify::new());
+        let started = Arc::new(tokio::sync::Notify::new());
+        let notify = dropped.clone();
+        let prefill_started = started.clone();
+        let prefill = axum::Router::new().route(
+            "/v1/messages",
+            axum::routing::post(move || {
+                let guard = NotifyOnDrop(notify.clone());
+                let started = prefill_started.clone();
+                async move {
+                    started.notify_one();
+                    // Headers and keepalive precede the actual prefill result.
+                    let stream = futures_util::stream::unfold(guard, |guard| async {
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                        Some((
+                            Ok::<_, std::io::Error>(bytes::Bytes::from_static(b": keepalive\n\n")),
+                            guard,
+                        ))
+                    });
+                    (
+                        [(CONTENT_TYPE, "text/event-stream")],
+                        Body::from_stream(stream),
+                    )
+                }
+            }),
+        );
+        let wait_started = started.clone();
+        let decode = axum::Router::new().route(
+            "/v1/messages",
+            axum::routing::post(move || {
+                let started = wait_started.clone();
+                async move {
+                    started.notified().await;
+                    // Ensure P headers arrive first, reproducing the old race.
+                    tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+                    let first = futures_util::stream::once(async {
+                        Ok::<_, std::io::Error>(bytes::Bytes::from_static(
+                            b"event: message_start\ndata: {\"type\":\"message_start\"}\n\n",
+                        ))
+                    });
+                    let stream = first.chain(futures_util::stream::pending());
+                    (
+                        [(CONTENT_TYPE, "text/event-stream")],
+                        Body::from_stream(stream),
+                    )
+                }
+            }),
+        );
+        let (router, tasks) = messages_test_pair(prefill, decode).await;
+        let body = crate::routers::native_protocol::NativeRequest(json!({
+            "model":"test","max_tokens":16,"messages":[],"stream":true
+        }));
+        let response = tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            router.route_messages(None, &body, None),
+        )
+        .await
+        .expect("P headers/keepalives must not prevent decode streaming");
+        let mut stream = response.into_body().into_data_stream();
+        let chunk = tokio::time::timeout(std::time::Duration::from_millis(100), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&chunk).contains("event: message_start"));
+        drop(stream);
+        tokio::time::timeout(std::time::Duration::from_secs(2), dropped.notified())
+            .await
+            .expect("P body must be cancelled with the client, not detached");
+        for task in tasks {
+            task.abort();
+        }
     }
 
     #[tokio::test]
